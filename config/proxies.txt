@@ -1,0 +1,10 @@
+# Proxy list — one per line
+# Format: ip:port:user:pass  (authenticated)
+#         ip:port              (open, not recommended)
+#
+# Residential / mobile proxies recommended.
+# Datacenter proxies will likely trigger Google's QR code.
+#
+# Example:
+# 192.168.1.1:8080:user:password
+# 10.0.0.2:1080
