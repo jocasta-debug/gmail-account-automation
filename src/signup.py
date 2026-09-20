@@ -131,6 +131,45 @@ def create_account(
     Execute the full Gmail signup flow in the given page/context.
     Returns an AccountResult with credentials on success.
     """
+    # Use a screenshots directory for this run
+    import datetime, os
+    run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    shot_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "screenshots", f"run_{run_ts}")
+    os.makedirs(shot_dir, exist_ok=True)
+    sc = lambda name: os.path.join(shot_dir, name)
+
+    # Helper: take screenshot with logging
+    def take_screenshot(page, filename, log_msg=None):
+        try:
+            path = sc(filename)
+            page.screenshot(path=path)
+            if log_msg:
+                log.info(f"  📸 {log_msg}: {path}")
+            return path
+        except Exception as e:
+            log.debug(f"  Screenshot failed for {filename}: {e}")
+            return None
+
+    # Helper: dump page DOM info as screenshot annotation
+    def dump_inputs(page, log_msg):
+        try:
+            inputs = page.evaluate("""() => {
+                const els = document.querySelectorAll('input, select, textarea, button');
+                return Array.from(els).slice(0, 20).map(el => ({
+                    tag: el.tagName,
+                    type: el.type || '',
+                    name: el.name || '',
+                    ariaLabel: el.getAttribute('aria-label') || '',
+                    placeholder: el.placeholder || '',
+                    text: (el.textContent || '').trim().substring(0, 50),
+                    visible: el.offsetParent !== null,
+                }));
+            }""")
+            log.debug(f"  {log_msg}: {inputs}")
+        except Exception:
+            pass
+
     result = AccountResult(
         full_name=f"{identity['first_name']} {identity['last_name']}",
         errors=[],
@@ -151,6 +190,7 @@ def create_account(
         log.info(f"[{identity['first_name']}] Navigating to Google signup...")
         page.goto(GOOGLE_SIGNUP_URL, wait_until="domcontentloaded", timeout=20000)
         human_pause(1, 3)
+        take_screenshot(page, "01_signup_entry.png", "Signup entry page")
 
         # ── Step 2: Fill personal information ───────────────────────────
         log.info(f"[{identity['first_name']}] Filling personal info...")
@@ -168,6 +208,10 @@ def create_account(
             human_type(page, "input[id='lastName']",
                        identity["last_name"], base_delay=0.12, mistake_prob=0.02)
             human_pause(0.3, 0.8)
+
+        # Screenshot: personal info filled
+        take_screenshot(page, "02_personal_info_filled.png", "Personal info filled")
+        dump_inputs(page, "Personal info page elements")
 
         # Click Next — direct click, no mouse movement
         next_clicked = False
@@ -210,48 +254,14 @@ def create_account(
         result.steps.append("personal_info_filled")
 
         # ── DEBUG: dump DOM to understand Google's actual selectors ──
-        try:
-            page.screenshot(path="/tmp/google_birthday_debug.png")
-            log.debug("  Birthday page screenshot saved")
-            dom_info = page.evaluate("""() => {
-                const selects = document.querySelectorAll('select');
-                return Array.from(selects).map(s => ({
-                    outerHTML: s.outerHTML.substring(0, 300),
-                    name: s.name || '',
-                    id: s.id || '',
-                    ariaLabel: s.getAttribute('aria-label') || '',
-                    placeholder: s.placeholder || '',
-                    options: Array.from(s.options).map(o => ({text: o.text.trim().substring(0,30), value: o.value})),
-                }));
-            }""")
-            log.debug(f"  Select elements: {dom_info}")
-        except Exception:
-            pass
-
-        # Debug: screenshot the birthday/gender page before filling
-        try:
-            page.screenshot(path="/tmp/google_birthday_debug.png")
-            log.debug("  Birthday page screenshot saved")
-        except Exception:
-            pass
-
-        # Debug: dump the combobox triggers
-        try:
-            triggers = page.evaluate("""() => {
-                const comboboxes = document.querySelectorAll('div[role="combobox"]');
-                return Array.from(comboboxes).map(c => ({
-                    id: c.id,
-                    hasAriaLabel: c.hasAttribute('aria-label'),
-                    ariaLabel: c.getAttribute('aria-label') || '',
-                    outerHTML: c.outerHTML.substring(0, 300),
-                }));
-            }""")
-            log.debug(f"  Combobox triggers: {triggers}")
-        except Exception:
-            pass
+        # (kept for debugging — screenshots handle visualization now)
 
         # ── Step 3: Birthday and Gender ────────────────────────────────
         log.info(f"[{identity['first_name']}] Filling birthday/gender...")
+
+        # Screenshot: birthday page before filling
+        take_screenshot(page, "03_birthday_page.png", "Birthday/gender page")
+        dump_inputs(page, "Birthday page elements")
 
         birthday = identity["birthday"]  # format: MMDDYYYY
         mm, dd, yyyy = birthday[:2], birthday[2:4], birthday[4:]
@@ -326,6 +336,10 @@ def create_account(
         gender_label = gender.capitalize()
         gender_filled = birthday_gender._select_combobox_option(
             page, "Gender", gender_label, log)
+
+        # Screenshot: birthday+gender filled
+        take_screenshot(page, "04_birthday_gender_filled.png", "Birthday and gender filled")
+        dump_inputs(page, "After birthday/gender")
 
         human_pause(0.3, 0.8)
 
@@ -434,6 +448,10 @@ def create_account(
                 human_pause(0.3, 0.8)
                 result.email = f"{username}@gmail.com"
 
+                # Screenshot: email selected
+                take_screenshot(page, "05_email_selected.png", "Email/username selected")
+                dump_inputs(page, "Email page elements")
+
                 # Check availability / next — direct click
                 next_clicked = False
                 for sel in [
@@ -471,6 +489,10 @@ def create_account(
                 human_type(page, confirm, password, base_delay=0.1, mistake_prob=0.01)
                 human_pause(0.5, 1.0)
 
+            # Screenshot: password set
+            take_screenshot(page, "06_password_set.png", "Password set")
+            dump_inputs(page, "Password page elements")
+
             # Next
             if wait_for_selector(page, "div[role='button']:has-text('Next')", timeout=8000):
                 human_click(page, "div[role='button']:has-text('Next')")
@@ -483,14 +505,18 @@ def create_account(
         if solve_recaptcha_v2(page, timeout=120):
             log.info("CAPTCHA solved")
             human_pause(1, 3)
+            take_screenshot(page, "07_captcha_solved.png", "CAPTCHA solved")
         else:
             log.info("No CAPTCHA detected or solving failed")
+            take_screenshot(page, "07_no_captcha.png", "No CAPTCHA page")
 
         # ── Step 7: Phone verification / QR check ──────────────────────
         log.info(f"[{identity['first_name']}] Checking phone/QR step...")
 
         # Detect what screen we're on
         page_text = page.inner_text("body").lower()
+        take_screenshot(page, "08_phone_qr_check.png", "Phone/QR check page")
+        dump_inputs(page, "Phone/QR page elements")
 
         if "qr code" in page_text or "scan" in page_text:
             log.warning(f"[{identity['first_name']}] QR code screen detected!")
@@ -586,6 +612,9 @@ def create_account(
 
         # Wait for either success (no more "Next" buttons, welcome screen) or failure
         human_pause_long(5, 12)
+
+        # Screenshot: final page
+        take_screenshot(page, "09_final_result.png", "Final page")
 
         # Check if we're on a success/welcome page
         welcome_indicators = [
