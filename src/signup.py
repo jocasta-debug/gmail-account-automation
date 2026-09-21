@@ -126,11 +126,26 @@ def create_account(
     use_mobile: bool = True,
     sms_enabled: bool = True,
     attempt: int = 1,
+    config_overrides: Optional[Dict[str, Any]] = None,
 ) -> AccountResult:
     """
     Execute the full Gmail signup flow in the given page/context.
     Returns an AccountResult with credentials on success.
+
+    config_overrides (optional): dict used by the autonomous diagnostic to
+    vary behavior per attempt without rewriting the flow:
+      - fingerprint_profile: "desktop" | "mobile"  (affects UA/viewport)
+      - pacing: "human" | "fast"
+      - phone_policy: "skip_if_offered" | "none"
+      - try_skip: bool  (whether to try the skip-button gamble at phone step)
+      - event_timeline: EventTimeline  (diagnostic event capture)
     """
+    overrides = config_overrides or {}
+    fingerprint_profile = overrides.get("fingerprint_profile", "mobile" if use_mobile else "desktop")
+    pacing = overrides.get("pacing", "human")
+    phone_policy = overrides.get("phone_policy", "skip_if_offered")
+    try_skip = overrides.get("try_skip", False)
+    timeline = overrides.get("event_timeline")
     # Use a screenshots directory for this run
     import datetime, os
     run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -180,6 +195,11 @@ def create_account(
 
     log.info(f"[{identity['first_name']}] Starting signup (attempt {attempt})...")
 
+    if timeline is not None:
+        timeline.emit("run_start", "entry",
+                      f"config={fingerprint_profile} pacing={pacing} "
+                      f"phone_policy={phone_policy} try_skip={try_skip}")
+
     try:
         # ── Step 0: Warm-up (if first attempt) ──────────────────────────
         if attempt == 1:
@@ -191,6 +211,8 @@ def create_account(
         page.goto(GOOGLE_SIGNUP_URL, wait_until="domcontentloaded", timeout=20000)
         human_pause(1, 3)
         take_screenshot(page, "01_signup_entry.png", "Signup entry page")
+        if timeline is not None:
+            timeline.emit("step_enter", "entry", "Navigated to Google signup")
 
         # ── Step 2: Fill personal information ───────────────────────────
         log.info(f"[{identity['first_name']}] Filling personal info...")
@@ -262,6 +284,9 @@ def create_account(
         # Screenshot: birthday page before filling
         take_screenshot(page, "03_birthday_page.png", "Birthday/gender page")
         dump_inputs(page, "Birthday page elements")
+        if timeline is not None:
+            timeline.emit("step_enter", "birthday_gender",
+                          "On birthday/gender page")
 
         birthday = identity["birthday"]  # format: MMDDYYYY
         mm, dd, yyyy = birthday[:2], birthday[2:4], birthday[4:]
@@ -364,6 +389,9 @@ def create_account(
         human_pause_long(2, 5)
 
         result.steps.append("birthday_gender_filled")
+        if timeline is not None:
+            timeline.emit("step_exit", "birthday_gender",
+                          "Birthday and gender submitted; advancing to email")
 
         # ── Step 4: Email / Username ────────────────────────────────────
         log.info(f"[{identity['first_name']}] Choosing email...")
@@ -374,6 +402,9 @@ def create_account(
             log.debug("  Email page screenshot saved")
         except Exception:
             pass
+        if timeline is not None:
+            timeline.emit("step_enter", "email",
+                          "On email/username page")
 
         # Debug: dump what inputs are actually on the page
         try:
@@ -474,6 +505,9 @@ def create_account(
                 log.warning("  Could not find email input field")
 
         result.steps.append("email_selected")
+        if timeline is not None:
+            timeline.emit("step_exit", "email",
+                          "Email/username submitted; advancing to password")
 
         # ── Step 5: Password ────────────────────────────────────────────
         log.info(f"[{identity['first_name']}] Setting password...")
@@ -498,17 +532,27 @@ def create_account(
                 human_click(page, "div[role='button']:has-text('Next')")
                 human_pause_long(3, 6)
 
-        result.steps.append("password_set")
+            result.steps.append("password_set")
+            if timeline is not None:
+                timeline.emit("step_exit", "password",
+                              "Password submitted")
 
-        # ── Step 6: CAPTCHA check ───────────────────────────────────────
+            # ── Step 6: CAPTCHA check ───────────────────────────────────────
         log.info(f"[{identity['first_name']}] Checking for CAPTCHA...")
+        captcha_detected = False
         if solve_recaptcha_v2(page, timeout=120):
             log.info("CAPTCHA solved")
             human_pause(1, 3)
             take_screenshot(page, "07_captcha_solved.png", "CAPTCHA solved")
+            captcha_detected = True
         else:
             log.info("No CAPTCHA detected or solving failed")
             take_screenshot(page, "07_no_captcha.png", "No CAPTCHA page")
+
+        if timeline is not None:
+            timeline.emit("step_exit", "captcha",
+                          "CAPTCHA check complete",
+                          {"captcha_detected": captcha_detected})
 
         # ── Step 7: Phone verification / QR check ──────────────────────
         log.info(f"[{identity['first_name']}] Checking phone/QR step...")
@@ -517,19 +561,42 @@ def create_account(
         page_text = page.inner_text("body").lower()
         take_screenshot(page, "08_phone_qr_check.png", "Phone/QR check page")
         dump_inputs(page, "Phone/QR page elements")
+        if timeline is not None:
+            timeline.emit("step_enter", "phone_or_qr",
+                          "At phone/QR decision gate",
+                          {"page_text": page_text[:300]})
 
+        qr_seen_here = False
         if "qr code" in page_text or "scan" in page_text:
             log.warning(f"[{identity['first_name']}] QR code screen detected!")
+            qr_seen_here = True
+            if timeline is not None:
+                timeline.emit("QRSeen", "qr",
+                              "QR code screen detected",
+                              {"detail": "Google presented a QR code for verification"})
             if handle_qr_code(page):
                 log.info("QR code handled")
                 human_pause(2, 4)
+                if timeline is not None:
+                    timeline.emit("step_exit", "qr",
+                                  "QR code handled (decoded + verification URL opened)")
             else:
                 result.errors.append("QR bypass failed")
                 log.error("QR bypass failed — this account likely failed")
+                if timeline is not None:
+                    timeline.emit("Error", "qr",
+                                  "QR bypass failed",
+                                  {"error": "handle_qr_code returned False"})
 
         # ── Step 8: Phone verification (if asked) ──────────────────────
+        phone_prompt_here = False
         if "phone number" in page_text or "mobile" in page_text or \
            "telephone" in page_text or "verify" in page_text:
+            phone_prompt_here = True
+            if timeline is not None:
+                timeline.emit("PhonePrompt", "phone_sms",
+                              "Phone verification prompt detected",
+                              {"page_text": page_text[:300]})
 
             # Look for skip button first
             skip_selectors = [
@@ -546,12 +613,24 @@ def create_account(
                         el.click()
                         log.info("Phone verification skipped")
                         skipped = True
+                        if timeline is not None:
+                            timeline.emit("SkipOfferedAndUsed", "phone_skip",
+                                          "Skip button found and clicked",
+                                          {"selector": sel})
+                        if phone_policy == "none":
+                            if timeline is not None:
+                                timeline.emit("SkipOfferedButNotUsed", "phone_skip",
+                                              "Skip offered but policy=skip_if_offered disabled",
+                                              {"selector": sel})
                         break
                 except Exception:
                     continue
 
             if not skipped and sms_enabled and get_5sim_key():
                 log.info("Attempting SMS verification via 5sim...")
+                if timeline is not None:
+                    timeline.emit("OtpPrompted", "phone_sms",
+                                  "Proceeding to SMS verification via 5sim")
                 code = get_google_verification_code(timeout=90)
                 if code:
                     # Enter phone number
@@ -588,8 +667,15 @@ def create_account(
                                         human_click(page, "div[role='button']")
                                         human_pause_long(3, 6)
                                         result.phone_used = number
+                                        if timeline is not None:
+                                            timeline.emit("OtpSent", "phone_sms",
+                                                          "SMS code received and submitted via 5sim",
+                                                          {"phone_used": number})
             else:
                 log.info("SMS not enabled or no 5sim key — attempting skip...")
+                if timeline is not None:
+                    timeline.emit("PhonePrompt", "phone_skip",
+                                  "SMS unavailable; attempting skip fallbacks")
                 # Final attempt to find and click any skip option
                 for sel in [
                     "text=Skip for now",
@@ -601,11 +687,19 @@ def create_account(
                         if el.count() > 0:
                             el.click()
                             log.info(f"Clicked: {sel}")
+                            if timeline is not None:
+                                timeline.emit("SkipOfferedAndUsed", "phone_skip",
+                                              f"Late skip fallback clicked: {sel}")
                             break
                     except Exception:
                         continue
 
         result.steps.append("phone_handled")
+        if timeline is not None:
+            timeline.emit("step_exit", "phone_or_qr",
+                          "Phone/QR step complete",
+                          {"phone_prompt_here": phone_prompt_here,
+                           "qr_seen_here": qr_seen_here})
 
         # ── Step 9: Final completion ─────────────────────────────────────
         log.info(f"[{identity['first_name']}] Waiting for account creation to complete...")
@@ -641,10 +735,17 @@ def create_account(
                 result.success = result.email != ""
 
         result.steps.append("creation_complete")
+        if timeline is not None:
+            timeline.emit("step_exit", "final",
+                          "Account creation complete",
+                          {"success": result.success, "email": result.email})
 
     except Exception as e:
         result.errors.append(f"Flow exception: {e}")
-        log.error(f"[{identity['first_name']}] 💥 Signup flow crashed: {e}")
+        log.error(f"[{identity['first_name']}] \U0001f4e5 Signup flow crashed: {e}")
+        if timeline is not None:
+            timeline.emit("Error", "crash",
+                          f"Signup flow crashed: {e}")
 
     return result
 
